@@ -29,6 +29,7 @@ import './render-counter'
 // app under REAL sessions instead of a synthetic scenario's toy transcripts.
 // window.__PERF_LIVE__.on() in the console, then just use the app.
 import './perf-live'
+import './right-pane-probe'
 
 // Update-flow simulator — window.__SIMULATE_UPDATE__() drives the updates
 // overlay through realistic applying/terminal states without quitting the app.

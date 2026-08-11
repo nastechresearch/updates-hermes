@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 from gateway.config import Platform, PlatformConfig
@@ -30,6 +31,14 @@ from gateway.relay.transport import RelayTransport
 from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
+
+# Keep the drain-path going-idle ACK budget strictly under the runner's default
+# adapter disconnect timeout (5s). If go_idle consumes the whole outer budget,
+# cancellation can fire before transport.disconnect() and leave the websocket
+# open. Paired with transport teardown budgets of 1s each for supervisor,
+# reader, and ws.close (~3s), the full drain path stays inside 5s.
+_RELAY_GO_IDLE_ON_DISCONNECT_TIMEOUT_S = 2.0
+_RELAY_REVOCATION_MONITOR_TEARDOWN_TIMEOUT_S = 1.0
 
 
 def _utf16_len(text: str) -> int:
@@ -77,6 +86,10 @@ class RelayAdapter(BasePlatformAdapter):
         # feedback off SendResult — see send()). Consumed by the gateway's
         # semantic thread-rename lane; bounded like the sibling caches.
         self._auto_thread_by_chat: Dict[str, Tuple[str, str]] = {}
+        # chat_id -> event fired when the entry above lands, so a consumer that
+        # arrives before the send can wait for it instead of polling. See
+        # wait_for_auto_thread_info.
+        self._auto_thread_waiters: Dict[str, asyncio.Event] = {}
         # chat_id -> chat_type (e.g. "dm", "channel", "group") learned from the
         # inbound event. Used to reproduce native Slack's synthetic-DM-thread
         # suppression on the relay lane: a DM streaming reply carries
@@ -475,6 +488,24 @@ class RelayAdapter(BasePlatformAdapter):
         except Exception:  # noqa: BLE001 - media localization must never break inbound
             logger.debug("relay inbound media localization failed", exc_info=True)
 
+    def prime_routing_cache(self, event) -> None:
+        """Warm the per-chat egress routing caches from a SYNTHETIC event.
+
+        The caches (_scope_by_chat/_dm_user_by_chat/...) are normally warmed
+        only by the inbound path (_on_inbound -> _capture_scope). A synthetic
+        completion turn injected right after a restart (durable
+        async-delegation replay) reaches handle_message with the caches COLD,
+        so every reply it produces egresses without metadata.scope_id /
+        metadata.user_id and is declined by the connector's fail-closed
+        tenant guard ("target not routed to an onboarded tenant" — staging
+        2026-08-09, defect #4). The synthetic event's session-store origin
+        already carries the discriminators; feed it through the same capture
+        used for real inbound. Never raises.
+        """
+        if event is None or getattr(event, "source", None) is None:
+            return
+        self._capture_scope(event)
+
     def _capture_scope(self, event) -> None:
         """Remember a chat_id's egress discriminator from an inbound event so our
         outbound (the agent's reply) can re-assert it for the connector's egress
@@ -811,13 +842,27 @@ class RelayAdapter(BasePlatformAdapter):
         return parts
 
     async def disconnect(self) -> None:
+        # Budget accounting: the runner wraps this whole call in
+        # asyncio.wait_for(_adapter_disconnect_timeout_secs()). Everything we
+        # spend on monitor teardown and go_idle below eats into what the
+        # transport can spend on its outbound drain, so measure from the top
+        # and thread the REMAINDER down — otherwise worst-case
+        # monitor(1s) + go_idle(2s) + drain + 3×teardown(1s) can blow the 5s
+        # budget, cancelling teardown mid-drain and skipping the transport's
+        # fail-pending loop (callers then block on _OUTBOUND_TIMEOUT_S).
+        from gateway.relay.ws_transport import _env_disconnect_budget_s
+        _started = time.monotonic()
+        _budget = _env_disconnect_budget_s()
         # Phase 7 Unit 7d-B: stop the revocation monitor first so it can't fire a
         # spurious fatal during/after a deliberate teardown.
         if self._revocation_monitor is not None:
             self._revocation_monitor.cancel()
             try:
-                await self._revocation_monitor
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
+                await asyncio.wait_for(
+                    self._revocation_monitor,
+                    timeout=_RELAY_REVOCATION_MONITOR_TEARDOWN_TIMEOUT_S,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
                 pass
             self._revocation_monitor = None
         if self._transport is not None:
@@ -831,15 +876,41 @@ class RelayAdapter(BasePlatformAdapter):
             # the ack (Q-5.3c). Best-effort + guarded: a transport without go_idle
             # (the stub) or a failed/timed-out ack must not block shutdown — we
             # proceed to disconnect exactly as before, no regression.
-            go_idle = getattr(self._transport, "go_idle", None)
-            if callable(go_idle):
+            #
+            # transport.disconnect() runs in finally so an outer cancellation
+            # during go_idle (runner default adapter budget is 5s) still closes
+            # the socket/supervisor instead of leaking them. shield() keeps the
+            # teardown await itself from being cancelled mid-flight.
+            try:
+                go_idle = getattr(self._transport, "go_idle", None)
+                if callable(go_idle):
+                    try:
+                        result: Any = go_idle(
+                            timeout_s=_RELAY_GO_IDLE_ON_DISCONNECT_TIMEOUT_S
+                        )
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception:  # noqa: BLE001 - going-idle is an optimization, never blocks drain
+                        logger.debug(
+                            "relay going_idle failed during drain", exc_info=True
+                        )
+            finally:
                 try:
-                    result: Any = go_idle()
-                    if asyncio.iscoroutine(result):
-                        await result
-                except Exception:  # noqa: BLE001 - going-idle is an optimization, never blocks drain
-                    logger.debug("relay going_idle failed during drain", exc_info=True)
-            await self._transport.disconnect()
+                    _remaining = max(0.0, _budget - (time.monotonic() - _started))
+                    try:
+                        _td = cast(Any, self._transport).disconnect(
+                            budget_s=_remaining
+                        )
+                    except TypeError:
+                        # Transports without the budget_s keyword (stubs,
+                        # older implementations) keep the legacy signature.
+                        _td = self._transport.disconnect()
+                    await asyncio.shield(_td)
+                except Exception:  # noqa: BLE001 - teardown must not block outer cancel propagation
+                    logger.debug(
+                        "relay transport disconnect failed during drain",
+                        exc_info=True,
+                    )
 
     async def go_dormant(self) -> bool:
         """Quiesce the relay for a scale-to-zero suspend (D12 / Phase 0).
@@ -965,6 +1036,13 @@ class RelayAdapter(BasePlatformAdapter):
                     )
         except Exception:  # noqa: BLE001 - feedback capture must never break send
             pass
+        # Wake the rename lane on EVERY send into this chat, not only the ones
+        # that auto-threaded. It is waiting to learn where this turn's reply
+        # landed, and "nowhere new" is an answer — one it should get now rather
+        # than by outlasting a timeout.
+        waiter = self._auto_thread_waiters.get(str(chat_id))
+        if waiter is not None:
+            waiter.set()
         return SendResult(
             success=bool(result.get("success")),
             message_id=result.get("message_id"),
@@ -978,6 +1056,42 @@ class RelayAdapter(BasePlatformAdapter):
         for the most recent send into *chat_id*, if any. Consumed by the
         gateway's semantic thread-rename lane (auto session title)."""
         return self._auto_thread_by_chat.get(str(chat_id))
+
+    async def wait_for_auto_thread_info(
+        self, chat_id: str, timeout: float
+    ) -> Optional[Tuple[str, str]]:
+        """``auto_thread_info_for_chat``, but willing to wait for the send.
+
+        The rename lane asks where the reply landed as soon as the session is
+        titled, and the session is titled from the user's opening message —
+        before the model has answered, let alone before we've sent anything. So
+        the question arrives a whole turn early, and a turn is a one-liner or
+        twenty minutes of tool calls.
+
+        Waits for the next send into this chat and then answers, so a reply the
+        connector didn't auto-thread reports its miss as soon as it's sent
+        instead of holding until *timeout* — which is only a backstop for a turn
+        that never sends at all.
+        """
+        info = self.auto_thread_info_for_chat(chat_id)
+        if info is not None:
+            return info
+        key = str(chat_id)
+        waiter = self._auto_thread_waiters.get(key)
+        if waiter is None:
+            waiter = asyncio.Event()
+            self._auto_thread_waiters[key] = waiter
+        try:
+            await asyncio.wait_for(waiter.wait(), timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            # Only the waiter we may have installed, and only if no later call
+            # replaced it; a fired event must not be left behind to make the
+            # next turn's wait return instantly on stale feedback.
+            if self._auto_thread_waiters.get(key) is waiter:
+                self._auto_thread_waiters.pop(key, None)
+        return self.auto_thread_info_for_chat(chat_id)
 
     def _resolve_reply_to_for_send(
         self,
@@ -2060,6 +2174,7 @@ class RelayAdapter(BasePlatformAdapter):
         name: str,
         *,
         only_if_current_name: Optional[str] = None,
+        prefer_connector_created: bool = False,
         parent_chat_id: Optional[str] = None,
     ) -> bool:
         """Best-effort thread rename via the connector's `thread_rename` op.
@@ -2068,10 +2183,15 @@ class RelayAdapter(BasePlatformAdapter):
         called by the SAME semantic-rename lane (run.py
         _rename_discord_auto_thread_for_session_title), which fires only for
         sources carrying the connector-stamped auto-thread markers.
-        ``only_if_current_name`` crosses the wire; the CONNECTOR enforces the
-        no-clobber guard (it owns the platform read), failing safe on
-        platforms that can't read the current name. ``parent_chat_id`` is
-        the containing chat where the caller knows it (Telegram needs it);
+
+        No-clobber guard: prefer ``prefer_connector_created=True``, which asks
+        the CONNECTOR to enforce the guard from ITS OWN created-name memory
+        (only_if_connector_created) — the gateway no longer has to reproduce
+        the thread's initial name byte-for-byte, which drifted on any
+        normalization difference and silently declined every relay rename.
+        ``only_if_current_name`` is the legacy string guard, kept for the
+        native-marker lane and older connectors. ``parent_chat_id`` is the
+        containing chat where the caller knows it (Telegram needs it);
         defaults to the thread id itself (Discord ignores chat_id).
         """
         if self._transport is None or not self.descriptor.supports_op("thread_rename"):
@@ -2087,7 +2207,9 @@ class RelayAdapter(BasePlatformAdapter):
             "thread_name": cleaned[:100],
             "metadata": self._with_scope(chat_id, None),
         }
-        if only_if_current_name is not None:
+        if prefer_connector_created:
+            action["only_if_connector_created"] = True
+        elif only_if_current_name is not None:
             action["only_if_current_name"] = str(only_if_current_name)
         try:
             result = await self._transport.send_outbound(
