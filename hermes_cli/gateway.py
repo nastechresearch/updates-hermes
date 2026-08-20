@@ -5,6 +5,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+from hermes_cli.cli_output import line_input
 import json
 import logging
 import os
@@ -3261,19 +3262,20 @@ def _append_node_dir_for_service(
 
     PATH lookup remains the fallback rung for installs with no managed Node.
     """
-    from hermes_constants import iter_hermes_node_dirs
+    from hermes_constants import (
+        hermes_managed_node_tree_present,
+        iter_hermes_node_dirs,
+    )
 
-    managed_node_present = False
-    for directory in iter_hermes_node_dirs(hermes_root):
+    managed_node_present = hermes_managed_node_tree_present(hermes_root)
+    for directory in iter_hermes_node_dirs(hermes_root) if managed_node_present else ():
         entry = str(directory)
         try:
             present = directory.is_dir()
         except OSError:
             present = False
-        if present:
-            managed_node_present = True
-            if entry not in path_entries:
-                path_entries.append(entry)
+        if present and entry not in path_entries:
+            path_entries.append(entry)
 
     # Ambient PATH lookup is a fallback, not an additional rung. Once the
     # target Hermes home provides managed Node, consulting the invoker's PATH
@@ -6811,7 +6813,7 @@ def _setup_signal():
     print_info("  Enter the URL where signal-cli HTTP daemon is running.")
     default_url = existing_url or "http://127.0.0.1:8080"
     try:
-        url = input(f"  HTTP URL [{default_url}]: ").strip() or default_url
+        url = line_input(f"  HTTP URL [{default_url}]: ").strip() or default_url
     except (EOFError, KeyboardInterrupt):
         print("\n  Setup cancelled.")
         return
@@ -6843,7 +6845,7 @@ def _setup_signal():
     print_info("  Example: +15551234567")
     default_account = existing_account or ""
     try:
-        account = input(
+        account = line_input(
             f"  Account number{f' [{default_account}]' if default_account else ''}: "
         ).strip()
         if not account:
@@ -6866,7 +6868,7 @@ def _setup_signal():
     default_allowed = existing_allowed or account
     try:
         allowed = (
-            input(f"  Allowed users [{default_allowed}]: ").strip() or default_allowed
+            line_input(f"  Allowed users [{default_allowed}]: ").strip() or default_allowed
         )
     except (EOFError, KeyboardInterrupt):
         print("\n  Setup cancelled.")
@@ -6884,7 +6886,7 @@ def _setup_signal():
         existing_groups = get_env_value("SIGNAL_GROUP_ALLOWED_USERS") or ""
         try:
             groups = (
-                input(f"  Group IDs [{existing_groups or '*'}]: ").strip()
+                line_input(f"  Group IDs [{existing_groups or '*'}]: ").strip()
                 or existing_groups
                 or "*"
             )
@@ -7510,7 +7512,7 @@ def _gateway_command_inner(args):
     # Service management commands
     if subcmd == "install":
         if is_managed():
-            managed_error("install gateway service (managed by NixOS)")
+            managed_error("install gateway service")
             return
         force = getattr(args, "force", False)
         system = getattr(args, "system", False)
@@ -7622,7 +7624,7 @@ def _gateway_command_inner(args):
 
     elif subcmd == "uninstall":
         if is_managed():
-            managed_error("uninstall gateway service (managed by NixOS)")
+            managed_error("uninstall gateway service")
             return
         system = getattr(args, "system", False)
         if is_termux():
